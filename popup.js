@@ -1,14 +1,20 @@
 document.addEventListener("DOMContentLoaded", function () {
   document.querySelector("#config").addEventListener("click", function () {
-    window.open(chrome.runtime.getURL("options.html"));
+    // openOptionsPage is the supported way to reach the settings page;
+    // window.open from a popup is not reliable in every browser.
+    if (chrome.runtime.openOptionsPage) {
+      chrome.runtime.openOptionsPage();
+    } else {
+      window.open(chrome.runtime.getURL("options.html"));
+    }
   });
 
   document.querySelector("#about").addEventListener("click", function () {
-    window.open("https://github.com/codebicycle/videospeed");
+    window.open("https://github.com/KrzysD86/videospeed");
   });
 
   document.querySelector("#feedback").addEventListener("click", function () {
-    window.open("https://github.com/codebicycle/videospeed/issues");
+    window.open("https://github.com/KrzysD86/videospeed/issues");
   });
 
   document.querySelector("#enable").addEventListener("click", function () {

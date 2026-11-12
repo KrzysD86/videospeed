@@ -25,8 +25,46 @@ var tc = {
   },
 
   // Holds a reference to all of the AUDIO/VIDEO DOM elements we've attached to
-  mediaElements: []
+  mediaElements: [],
+
+  // Remembers which speed each AUDIO/VIDEO element should play at, so that it
+  // survives the controller being torn down and rebuilt for the same element.
+  savedTargets: new WeakMap()
 };
+
+// Browsers reject playback rates outside of 0.0625 - 16.
+var MIN_SPEED = 0.07;
+var MAX_SPEED = 16;
+
+// Websites often reset playbackRate (usually back to 1.0) when a video loads,
+// plays, pauses or seeks. A speed change that this extension didn't make and
+// that lands shortly after one of these events is treated as such a reset and
+// is undone, so the user's speed sticks.
+var RESET_PRONE_EVENTS = [
+  "loadstart",
+  "emptied",
+  "loadedmetadata",
+  "play",
+  "playing",
+  "pause",
+  "seeking",
+  "seeked"
+];
+var RESET_WINDOW_MS = 1000;
+
+// A speed change that this extension didn't make and that is NOT near one of
+// the events above is probably deliberate (e.g. the website's own speed menu).
+// It is kept for that video only, unless a reset-prone event follows within
+// this delay. It is never saved as the remembered speed.
+var ADOPT_DELAY_MS = 300;
+
+// Safety valve so we never end up in an endless tug of war with a website or
+// another extension that keeps setting its own speed.
+var MAX_REVERTS_PER_SECOND = 50;
+
+// chrome.storage.sync has write quotas, so rapid key presses are batched into
+// a single save.
+var SAVE_DELAY_MS = 500;
 
 /* Log levels (depends on caller specifying the correct level)
   1 - none
@@ -119,7 +157,7 @@ chrome.storage.sync.get(tc.settings, function (storage) {
       blacklist: tc.settings.blacklist.replace(regStrip, "")
     });
   }
-  tc.settings.lastSpeed = Number(storage.lastSpeed);
+  tc.settings.lastSpeed = normalizeSpeed(storage.lastSpeed);
   tc.settings.displayKeyCode = Number(storage.displayKeyCode);
   tc.settings.rememberSpeed = Boolean(storage.rememberSpeed);
   tc.settings.forceLastSavedSpeed = Boolean(storage.forceLastSavedSpeed);
@@ -153,12 +191,6 @@ function getKeyBindings(action, what = "value") {
   }
 }
 
-function setKeyBindings(action, value) {
-  tc.settings.keyBindings.find((item) => item.action === action)[
-    "value"
-  ] = value;
-}
-
 function defineVideoController() {
   // Data structures
   // ---------------
@@ -181,62 +213,38 @@ function defineVideoController() {
 
     this.video = target;
     this.parent = target.parentElement || parent;
-    storedSpeed = tc.settings.speeds[target.currentSrc];
-    if (!tc.settings.rememberSpeed) {
-      if (!storedSpeed) {
-        log(
-          "Overwriting stored speed to 1.0 due to rememberSpeed being disabled",
-          5
-        );
-        storedSpeed = 1.0;
-      }
-      setKeyBindings("reset", getKeyBindings("fast")); // resetSpeed = fastSpeed
-    } else {
-      log("Recalling stored speed due to rememberSpeed being enabled", 5);
-      storedSpeed = tc.settings.lastSpeed;
-    }
+    this.currentSrc = target.currentSrc;
+    this.lastMediaEventTime = 0;
+    this.revertTimes = [];
+    this.adoptTimer = null;
 
-    log("Explicitly setting playbackRate to: " + storedSpeed, 5);
-    target.playbackRate = storedSpeed;
+    // resetSpeed isn't really a reset, it's a toggle. This is the speed the
+    // R / G keys toggle back to, kept per video so that other videos on the
+    // page (previews, ads) can't overwrite it.
+    this.toggleSpeed = tc.settings.rememberSpeed
+      ? getKeyBindings("reset")
+      : getKeyBindings("fast"); // resetSpeed = fastSpeed
+    setTargetSpeed(this, initialSpeedFor(target));
+
+    log("Explicitly setting playbackRate to: " + this.targetSpeed, 5);
+    if (!sameSpeed(target.playbackRate, this.targetSpeed)) {
+      try {
+        target.playbackRate = this.targetSpeed;
+      } catch (e) {
+        log("Unable to set playbackRate: " + e, 2);
+      }
+    }
 
     this.div = this.initializeControls();
 
-    var mediaEventAction = function (event) {
-      storedSpeed = tc.settings.speeds[event.target.currentSrc];
-      if (!tc.settings.rememberSpeed) {
-        if (!storedSpeed) {
-          log("Overwriting stored speed to 1.0 (rememberSpeed not enabled)", 4);
-          storedSpeed = 1.0;
-        }
-        // resetSpeed isn't really a reset, it's a toggle
-        log("Setting reset keybinding to fast", 5);
-        setKeyBindings("reset", getKeyBindings("fast")); // resetSpeed = fastSpeed
-      } else {
-        log(
-          "Storing lastSpeed into tc.settings.speeds (rememberSpeed enabled)",
-          5
-        );
-        storedSpeed = tc.settings.lastSpeed;
-      }
-      // TODO: Check if explicitly setting the playback rate to 1.0 is
-      // necessary when rememberSpeed is disabled (this may accidentally
-      // override a website's intentional initial speed setting interfering
-      // with the site's default behavior)
-      log("Explicitly setting playbackRate to: " + storedSpeed, 4);
-      setSpeed(event.target, storedSpeed);
-    };
-
-    target.addEventListener(
-      "play",
-      (this.handlePlay = mediaEventAction.bind(this))
+    // Put the user's speed back whenever the media does something that
+    // websites like to reset the speed on (load, play, pause, seek).
+    this.handleMediaEvent = onMediaEvent.bind(this);
+    RESET_PRONE_EVENTS.forEach((type) =>
+      target.addEventListener(type, this.handleMediaEvent)
     );
 
-    target.addEventListener(
-      "seeked",
-      (this.handleSeek = mediaEventAction.bind(this))
-    );
-
-    var observer = new MutationObserver((mutations) => {
+    var observer = (this.observer = new MutationObserver((mutations) => {
       mutations.forEach((mutation) => {
         if (
           mutation.type === "attributes" &&
@@ -252,7 +260,7 @@ function defineVideoController() {
           }
         }
       });
-    });
+    }));
     observer.observe(target, {
       attributeFilter: ["src", "currentSrc"]
     });
@@ -260,8 +268,11 @@ function defineVideoController() {
 
   tc.videoController.prototype.remove = function () {
     this.div.remove();
-    this.video.removeEventListener("play", this.handlePlay);
-    this.video.removeEventListener("seek", this.handleSeek);
+    RESET_PRONE_EVENTS.forEach((type) =>
+      this.video.removeEventListener(type, this.handleMediaEvent)
+    );
+    this.observer.disconnect();
+    cancelAdopt(this);
     delete this.video.vsc;
     let idx = tc.mediaElements.indexOf(this.video);
     if (idx != -1) {
@@ -415,39 +426,184 @@ function refreshCoolDown() {
   log("End refreshCoolDown", 5);
 }
 
-function setupListener() {
-  /**
-   * This function is run whenever a video speed rate change occurs.
-   * It is used to update the speed that shows up in the display as well as save
-   * that latest speed into the local storage.
-   *
-   * @param {*} video The video element to update the speed indicators for.
-   */
-  function updateSpeedFromEvent(video) {
-    // It's possible to get a rate change on a VIDEO/AUDIO that doesn't have
-    // a video controller attached to it.  If we do, ignore it.
-    if (!video.vsc)
+function normalizeSpeed(value) {
+  var speed = Number(value);
+  if (!isFinite(speed) || speed <= 0) {
+    return 1.0;
+  }
+  speed = Math.min(Math.max(speed, MIN_SPEED), MAX_SPEED);
+  return Number(speed.toFixed(2));
+}
+
+function sameSpeed(a, b) {
+  return Math.abs(a - b) < 0.005;
+}
+
+// The speed a media element should play at when we first see it, or when it
+// switches to a new source (e.g. the next video in the same player).
+function initialSpeedFor(video) {
+  var src = video.currentSrc;
+  var saved = tc.savedTargets.get(video);
+  if (saved && saved.src === src) {
+    // Same element, same media: the controller was just rebuilt. Carry on at
+    // the speed it was already playing at.
+    return saved.speed;
+  }
+  if (tc.settings.rememberSpeed) {
+    return tc.settings.lastSpeed;
+  }
+  return (src && tc.settings.speeds[src]) || 1.0;
+}
+
+// Records the speed a video *should* be playing at. Does not touch the video.
+function setTargetSpeed(vsc, speed) {
+  vsc.targetSpeed = speed;
+  tc.savedTargets.set(vsc.video, { src: vsc.video.currentSrc, speed: speed });
+}
+
+// Detects a new source on a reused element and picks the right speed for it.
+function syncSource(vsc) {
+  var src = vsc.video.currentSrc;
+  if (src === vsc.currentSrc) {
+    return;
+  }
+  vsc.currentSrc = src;
+  if (!src) {
+    return; // element emptied, wait for the next source
+  }
+  setTargetSpeed(vsc, initialSpeedFor(vsc.video));
+  log("New source, speed will be " + vsc.targetSpeed, 4);
+}
+
+function isNearMediaEvent(vsc) {
+  var video = vsc.video;
+  return (
+    video.seeking ||
+    video.readyState === 0 ||
+    Date.now() - vsc.lastMediaEventTime < RESET_WINDOW_MS
+  );
+}
+
+function mayRevert(vsc) {
+  var now = Date.now();
+  vsc.revertTimes = vsc.revertTimes.filter((t) => now - t < 1000);
+  if (vsc.revertTimes.length >= MAX_REVERTS_PER_SECOND) {
+    log("Something keeps overriding the speed, backing off", 3);
+    return false;
+  }
+  vsc.revertTimes.push(now);
+  return true;
+}
+
+function cancelAdopt(vsc) {
+  if (vsc.adoptTimer) {
+    clearTimeout(vsc.adoptTimer);
+    vsc.adoptTimer = null;
+  }
+}
+
+// Keep a speed the website set on purpose, for this video only, unless a
+// load/play/pause/seek event shows up right after it (then it was a reset).
+function scheduleAdopt(vsc) {
+  cancelAdopt(vsc);
+  vsc.adoptTimer = setTimeout(function () {
+    vsc.adoptTimer = null;
+    var rate = vsc.video.playbackRate;
+    if (vsc.video.vsc === vsc && !sameSpeed(rate, vsc.targetSpeed)) {
+      log("Keeping speed " + rate + " set by the website for this video", 4);
+      setTargetSpeed(vsc, rate);
+    }
+  }, ADOPT_DELAY_MS);
+}
+
+// Sets the playback rate WITHOUT treating it as a new choice by the user.
+function applySpeed(video, speed) {
+  if (!sameSpeed(video.playbackRate, speed)) {
+    try {
+      video.playbackRate = speed;
+    } catch (e) {
+      log("Unable to set playbackRate to " + speed + ": " + e, 2);
       return;
-    var speedIndicator = video.vsc.speedIndicator;
-    var src = video.currentSrc;
-    var speed = Number(video.playbackRate.toFixed(2));
+    }
+    refreshCoolDown();
+  }
+  video.vsc.speedIndicator.textContent = speed.toFixed(2);
+}
 
-    log("Playback rate changed to " + speed, 4);
+function showSpeed(video, rate) {
+  log("Playback rate changed to " + rate, 4);
+  video.vsc.speedIndicator.textContent = rate.toFixed(2);
+  // show the controller for 1000ms if it's hidden.
+  runAction("blink", null, null);
+}
 
-    log("Updating controller with new speed", 5);
-    speedIndicator.textContent = speed.toFixed(2);
-    tc.settings.speeds[src] = speed;
-    log("Storing lastSpeed in settings for the rememberSpeed feature", 5);
-    tc.settings.lastSpeed = speed;
-    log("Syncing chrome settings for lastSpeed", 5);
-    chrome.storage.sync.set({ lastSpeed: speed }, function () {
-      log("Speed setting saved: " + speed, 5);
-    });
-    // show the controller for 1000ms if it's hidden.
-    runAction("blink", null, null);
+// Bound to a videoController. Runs on its video's RESET_PRONE_EVENTS.
+function onMediaEvent(event) {
+  var vsc = this;
+  var video = vsc.video;
+  vsc.lastMediaEventTime = Date.now();
+  syncSource(vsc);
+  // A website speed change we were about to keep turned out to be part of
+  // this load/play/pause/seek, i.e. a reset. Don't keep it.
+  cancelAdopt(vsc);
+
+  if (sameSpeed(video.playbackRate, vsc.targetSpeed)) {
+    return;
+  }
+  if (mayRevert(vsc)) {
+    log("Restoring speed " + vsc.targetSpeed + " after " + event.type, 4);
+    applySpeed(video, vsc.targetSpeed);
+  } else if (!tc.settings.forceLastSavedSpeed) {
+    setTargetSpeed(vsc, video.playbackRate);
+  }
+}
+
+/**
+ * Runs whenever the playback rate of a controlled video changes, no matter
+ * who changed it. Only changes made by the user through this extension
+ * (setSpeed) are ever saved as the remembered speed. Everything else is
+ * either undone (a reset by the website around load/play/pause/seek, or any
+ * change at all when "Force last saved speed" is on) or kept for that one
+ * video only (e.g. the website's own speed menu).
+ */
+function handleRateChange(video, event) {
+  var vsc = video.vsc;
+  syncSource(vsc);
+  var rate = video.playbackRate;
+  var forced = tc.settings.forceLastSavedSpeed;
+
+  if (forced) {
+    // Hide all rate changes from the website's own listeners.
+    event.stopImmediatePropagation();
   }
 
-  document.addEventListener(
+  if (sameSpeed(rate, vsc.targetSpeed)) {
+    // Our own change, or nothing that matters.
+    showSpeed(video, rate);
+    return;
+  }
+
+  // Something other than this extension changed the speed.
+  var looksLikeReset = forced || isNearMediaEvent(vsc);
+  if (looksLikeReset && mayRevert(vsc)) {
+    log("Undoing speed change to " + rate + ", back to " + vsc.targetSpeed, 4);
+    event.stopImmediatePropagation();
+    cancelAdopt(vsc);
+    applySpeed(video, vsc.targetSpeed);
+    return;
+  }
+
+  showSpeed(video, rate);
+  if (!looksLikeReset) {
+    scheduleAdopt(vsc);
+  } else if (!forced) {
+    // We've been fighting this too often, give up and go along with it.
+    setTargetSpeed(vsc, rate);
+  }
+}
+
+function setupListener(doc) {
+  doc.addEventListener(
     "ratechange",
     function (event) {
       if (coolDown) {
@@ -455,22 +611,12 @@ function setupListener() {
         event.stopImmediatePropagation();
       }
       var video = event.target;
-
-      /**
-       * If the last speed is forced, only update the speed based on events created by
-       * video speed instead of all video speed change events.
-       */
-      if (tc.settings.forceLastSavedSpeed) {
-        if (event.detail && event.detail.origin === "videoSpeed") {
-          video.playbackRate = event.detail.speed;
-          updateSpeedFromEvent(video);
-        } else {
-          video.playbackRate = tc.settings.lastSpeed;
-        }
-        event.stopImmediatePropagation();
-      } else {
-        updateSpeedFromEvent(video);
+      // It's possible to get a rate change on a VIDEO/AUDIO that doesn't have
+      // a video controller attached to it.  If we do, ignore it.
+      if (!video || !video.vsc) {
+        return;
       }
+      handleRateChange(video, event);
     },
     true
   );
@@ -531,7 +677,7 @@ function initializeNow(document) {
     return;
   }
   try {
-    setupListener();
+    setupListener(document);
   } catch {
     // no operation
   }
@@ -573,11 +719,16 @@ function initializeNow(document) {
           return;
         }
 
-        // Ignore keydown event if typing in an input box
+        // Ignore keydown event if typing in an input box. composedPath()[0]
+        // is the real target even when the box lives inside a shadow root,
+        // where event.target only points at the shadow host.
+        var target =
+          (event.composedPath && event.composedPath()[0]) || event.target;
         if (
-          event.target.nodeName === "INPUT" ||
-          event.target.nodeName === "TEXTAREA" ||
-          event.target.isContentEditable
+          target.nodeName === "INPUT" ||
+          target.nodeName === "TEXTAREA" ||
+          target.nodeName === "SELECT" ||
+          target.isContentEditable
         ) {
           return false;
         }
@@ -694,29 +845,67 @@ function initializeNow(document) {
   log("End initializeNow", 5);
 }
 
+// Sets the speed because the USER asked for it (shortcut key or controller
+// button). This is the only place a video's wanted speed changes on purpose.
 function setSpeed(video, speed) {
   log("setSpeed started: " + speed, 5);
-  var speedvalue = speed.toFixed(2);
-  if (tc.settings.forceLastSavedSpeed) {
-    video.dispatchEvent(
-      new CustomEvent("ratechange", {
-        detail: { origin: "videoSpeed", speed: speedvalue }
-      })
-    );
-  } else {
-    video.playbackRate = Number(speedvalue);
+  var vsc = video.vsc;
+  speed = normalizeSpeed(speed);
+  cancelAdopt(vsc);
+  vsc.revertTimes = [];
+  setTargetSpeed(vsc, speed);
+  if (video.currentSrc) {
+    tc.settings.speeds[video.currentSrc] = speed;
   }
-  var speedIndicator = video.vsc.speedIndicator;
-  speedIndicator.textContent = speedvalue;
-  tc.settings.lastSpeed = speed;
-  refreshCoolDown();
+  applySpeed(video, speed);
   log("setSpeed finished: " + speed, 5);
+}
+
+// Saves the speed the user picked, for the "Remember playback speed" option.
+var pendingSavedSpeed = null;
+var saveTimer = null;
+function rememberUserSpeed(speed) {
+  tc.settings.lastSpeed = speed;
+  pendingSavedSpeed = speed;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushSavedSpeed, SAVE_DELAY_MS);
+}
+
+function flushSavedSpeed() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  if (pendingSavedSpeed === null) {
+    return;
+  }
+  var speed = pendingSavedSpeed;
+  pendingSavedSpeed = null;
+  chrome.storage.sync.set({ lastSpeed: speed }, function () {
+    log("Speed setting saved: " + speed, 5);
+  });
+}
+window.addEventListener("pagehide", flushSavedSpeed);
+
+// When one key press changes several videos at once (e.g. a hidden preview
+// player next to the real one), remember the speed of the one being watched:
+// prefer a playing video, then the biggest one.
+function pickPrimaryVideo(videos) {
+  function area(v) {
+    var rect = v.getBoundingClientRect();
+    return rect.width * rect.height;
+  }
+  return videos.reduce(function (best, v) {
+    if (best.paused !== v.paused) {
+      return v.paused ? best : v;
+    }
+    return area(v) > area(best) ? v : best;
+  });
 }
 
 function runAction(action, value, e) {
   log("runAction Begin", 5);
 
   var mediaTags = tc.mediaElements;
+  var changedVideos = [];
 
   // Get the controller that was used if called from a button press event e
   if (e) {
@@ -749,15 +938,18 @@ function runAction(action, value, e) {
           16
         );
         setSpeed(v, s);
+        changedVideos.push(v);
       } else if (action === "slower") {
         log("Decrease speed", 5);
         // Video min rate is 0.0625:
         // https://cs.chromium.org/chromium/src/third_party/blink/renderer/core/html/media/html_media_element.cc?gsn=kMinRate&l=165
         var s = Math.max(v.playbackRate - value, 0.07);
         setSpeed(v, s);
+        changedVideos.push(v);
       } else if (action === "reset") {
         log("Reset speed", 5);
         resetSpeed(v, 1.0);
+        changedVideos.push(v);
       } else if (action === "display") {
         log("Showing controller", 5);
         controller.classList.add("vsc-manual");
@@ -783,6 +975,7 @@ function runAction(action, value, e) {
         handleDrag(v, e);
       } else if (action === "fast") {
         resetSpeed(v, value);
+        changedVideos.push(v);
       } else if (action === "pause") {
         pause(v);
       } else if (action === "muted") {
@@ -794,6 +987,10 @@ function runAction(action, value, e) {
       }
     }
   });
+
+  if (changedVideos.length) {
+    rememberUserSpeed(pickPrimaryVideo(changedVideos).vsc.targetSpeed);
+  }
   log("runAction End", 5);
 }
 
@@ -809,7 +1006,7 @@ function pause(v) {
 
 function resetSpeed(v, target) {
   if (v.playbackRate === target) {
-    if (v.playbackRate === getKeyBindings("reset")) {
+    if (v.playbackRate === v.vsc.toggleSpeed) {
       if (target !== 1.0) {
         log("Resetting playback speed to 1.0", 4);
         setSpeed(v, 1.0);
@@ -819,11 +1016,11 @@ function resetSpeed(v, target) {
       }
     } else {
       log('Toggling playback speed to "reset" speed', 4);
-      setSpeed(v, getKeyBindings("reset"));
+      setSpeed(v, v.vsc.toggleSpeed);
     }
   } else {
     log('Toggling playback speed to "reset" speed', 4);
-    setKeyBindings("reset", v.playbackRate);
+    v.vsc.toggleSpeed = v.playbackRate;
     setSpeed(v, target);
   }
 }
